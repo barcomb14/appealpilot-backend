@@ -304,14 +304,15 @@ async function fetchATTOMAssessment(address, lat, lng) {
     const prop = res.data?.property?.[0];
     if (!prop) return null;
     return {
-      parcelId: prop.identifier?.apn,
-      assessedValue: prop.assessment?.assessed?.assdTtlValue || 0,
-      sqft: prop.building?.size?.universalsize || 0,
-      yearBuilt: prop.building?.summary?.yearbuilt || 0,
-      bedrooms: prop.building?.rooms?.beds || 0,
-      bathrooms: prop.building?.rooms?.bathstotal || 0,
-      source: 'ATTOM'
-    };
+  parcelId: prop.identifier?.apn,
+  assessedValue: prop.assessment?.assessed?.assdttlvalue || 0,
+  marketValue: prop.assessment?.market?.mktttlvalue || 0,
+  sqft: prop.building?.size?.universalsize || 0,
+  yearBuilt: prop.building?.summary?.yearbuilt || 0,
+  bedrooms: prop.building?.rooms?.beds || 0,
+  bathrooms: prop.building?.rooms?.bathstotal || 0,
+  source: 'ATTOM'
+};
   } catch (err) {
     console.error('ATTOM error:', err.message);
     return null;
