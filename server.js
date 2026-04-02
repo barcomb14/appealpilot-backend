@@ -361,6 +361,9 @@ function getFallbackNarrative(property, comps, county, recommendedAV, pct) {
 }
 
 // ── START ─────────────────────────────────────────────────────────
+app.get('/health', (req, res) => {
+  res.json({ ok: true, service: 'AppealPilot API' });
+});
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`AppealPilot API running on port ${PORT}`));
 module.exports = app;
