@@ -297,29 +297,41 @@ function detectCountyFromString(address) {
 
 async function fetchATTOMAssessment(address, lat, lng) {
   try {
-    const res = await axios.get('https://api.gateway.attomdata.com/propertyapi/v1.0.0/property/detail', {
-      headers: { 'apikey': process.env.ATTOM_API_KEY, 'accept': 'application/json' },
-      params: { address1: address.split(',')[0], address2: address.split(',').slice(1).join(',').trim() }
+    const res = await axios.get('https://api.gateway.attomdata.com/propertyapi/v1.0.0/property/basicprofile', {
+      headers: { 'APIKey': process.env.ATTOM_API_KEY, 'Accept': 'application/json' },
+      params: lat && lng
+        ? { latitude: lat, longitude: lng, radius: 0.1 }
+        : { address1: address }
     });
+
     const prop = res.data?.property?.[0];
-    console.log('ATTOM PROPERTY DEBUG:', JSON.stringify(prop, null, 2));
     if (!prop) return null;
+
+    const assessedValue =
+      Number(prop.assessment?.assessed?.assdttlvalue) ||
+      Number(prop.assessment?.market?.mktttlvalue ? Math.round(prop.assessment.market.mktttlvalue * 0.4) : 0) ||
+      0;
+
+    const marketValue =
+      Number(prop.assessment?.market?.mktttlvalue) ||
+      Number(assessedValue ? Math.round(assessedValue / 0.4) : 0) ||
+      0;
+
     return {
-  parcelId: prop.identifier?.apn,
-  assessedValue: prop.assessment?.assessed?.assdttlvalue || 0,
-  marketValue: prop.assessment?.market?.mktttlvalue || 0,
-  sqft: prop.building?.size?.universalsize || 0,
-  yearBuilt: prop.building?.summary?.yearbuilt || 0,
-  bedrooms: prop.building?.rooms?.beds || 0,
-  bathrooms: prop.building?.rooms?.bathstotal || 0,
-  source: 'ATTOM'
-};
+      parcelId: prop.identifier?.apn || 'N/A',
+      assessedValue,
+      marketValue,
+      sqft: Number(prop.building?.size?.universalsize || 0),
+      yearBuilt: Number(prop.summary?.yearbuilt || prop.building?.summary?.yearbuilt || 0),
+      bedrooms: Number(prop.building?.rooms?.beds || 0),
+      bathrooms: Number(prop.building?.rooms?.bathstotal || 0),
+      source: 'ATTOM'
+    };
   } catch (err) {
     console.error('ATTOM error:', err.message);
     return null;
   }
 }
-
 async function fetchATTOMComps({ lat, lng, sqft }) {
   try {
     const res = await axios.get('https://api.gateway.attomdata.com/propertyapi/v1.0.0/salescomparables/address', {
