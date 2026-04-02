@@ -74,7 +74,14 @@ app.post('/api/address/lookup',
         params: { address: address + ', Georgia', key: process.env.GOOGLE_MAPS_API_KEY, components: 'administrative_area:GA|country:US' }
       });
 
-      if (!geoRes.data.results?.length) return res.status(404).json({ error: 'Address not found.' });
+      if (!geoRes.data.results?.length) {
+  console.error('Google geocode failed:', geoRes.data.status, geoRes.data.error_message || 'no error_message', 'address:', address);
+  return res.status(404).json({
+    error: 'Address not found.',
+    googleStatus: geoRes.data.status,
+    googleMessage: geoRes.data.error_message || null
+  });
+}
 
       const result = geoRes.data.results[0];
       const { lat, lng } = result.geometry.location;
