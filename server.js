@@ -10,7 +10,8 @@ const rateLimit = require('express-rate-limit');
 const { body, validationResult } = require('express-validator');
 
 const app = express();
-const cache = new NodeCache({ stdTTL: 3600 });
+app.set('trust proxy', 1);
+const cache = new NodeCache({ stdTTL: 3600 }); // 1-hour cache
 
 // ── Clients ──────────────────────────────────────────────────────
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY || 'placeholder' });
@@ -18,7 +19,19 @@ const stripe = Stripe(process.env.STRIPE_SECRET_KEY || 'placeholder');
 sgMail.setApiKey(process.env.SENDGRID_API_KEY || 'placeholder');
 
 // ── Middleware ────────────────────────────────────────────────────
-app.use(cors({ origin: '*' }));
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(origin => origin.trim())
+  .filter(Boolean);
+
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true);
+    if (!allowedOrigins.length) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error('Not allowed by CORS'));
+  }
+}));
 app.use(express.json());
 app.use('/api/', rateLimit({ windowMs: 15 * 60 * 1000, max: 100 }));
 
