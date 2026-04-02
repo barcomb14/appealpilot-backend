@@ -302,6 +302,7 @@ async function fetchATTOMAssessment(address, lat, lng) {
       params: { address1: address.split(',')[0], address2: address.split(',').slice(1).join(',').trim() }
     });
     const prop = res.data?.property?.[0];
+    console.log('ATTOM PROPERTY DEBUG:', JSON.stringify(prop, null, 2));
     if (!prop) return null;
     return {
   parcelId: prop.identifier?.apn,
