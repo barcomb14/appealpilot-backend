@@ -106,7 +106,7 @@ app.post('/api/property/assessment',
     if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
     const { address, lat, lng, county } = req.body;
-    const cacheKey = 'assessment:' + address;
+    const cacheKey = 'assessment:v2:' + address;
     if (cache.has(cacheKey)) return res.json(cache.get(cacheKey));
 
     try {
