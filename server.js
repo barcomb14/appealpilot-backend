@@ -120,7 +120,18 @@ app.post('/api/property/assessment',
       }
 
       const countyConfig = GEORGIA_COUNTIES[county] || GEORGIA_COUNTIES['Fulton'];
-      const payload = { ...data, annualTax: Math.round(data.assessedValue * countyConfig.rate), countyMillage: countyConfig.millage, taxRate: countyConfig.rate, appealDeadline: countyConfig.deadline, assessorAddr: countyConfig.assessor };
+      const annualTax =
+        typeof data.annualTax === 'number' && data.annualTax > 0
+          ? Math.round(data.annualTax)
+          : Math.round(data.assessedValue * countyConfig.rate);
+      const payload = {
+        ...data,
+        annualTax,
+        countyMillage: countyConfig.millage,
+        taxRate: countyConfig.rate,
+        appealDeadline: countyConfig.deadline,
+        assessorAddr: countyConfig.assessor,
+      };
       cache.set(cacheKey, payload, 86400);
       res.json(payload);
     } catch (err) {
@@ -330,40 +341,63 @@ function mergeAttomPropertyRows(basicRow, detailRow, assessmentRow) {
   return merged;
 }
 
+/**
+ * Read numeric from ATTOM property[0] paths (JSON uses mixed camelCase from gateway).
+ * property[0].assessment.assessed.assdTtlValue, etc.
+ */
+function attomNum(value) {
+  if (value === undefined || value === null || value === '') return 0;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
 function mapAttomRowToAssessment(prop) {
+  const assessedBlock = prop.assessment?.assessed || {};
+  const marketBlock = prop.assessment?.market || {};
+  const taxBlock = prop.assessment?.tax || {};
   const size = prop.building?.size || {};
   const rooms = prop.building?.rooms || {};
-  const assessedValue =
-    Number(prop.assessment?.assessed?.assdttlvalue) ||
-    Number(
-      prop.assessment?.market?.mktttlvalue
-        ? Math.round(prop.assessment.market.mktttlvalue * 0.4)
-        : 0,
-    ) ||
-    0;
-  const marketValue =
-    Number(prop.assessment?.market?.mktttlvalue) ||
-    Number(assessedValue ? Math.round(assessedValue / 0.4) : 0) ||
-    0;
-  const sqft = Number(
-    size.universalsize || size.livingsize || size.bldgsize || size.grosssizeadjusted || 0,
+
+  const assessedValue = attomNum(
+    assessedBlock.assdTtlValue ?? assessedBlock.assdttlvalue,
   );
-  const yearBuilt = Number(
-    prop.summary?.yearbuilt ||
-      prop.building?.summary?.yearbuilteffective ||
-      prop.building?.summary?.yearbuilt ||
+  const marketValue = attomNum(
+    marketBlock.mktTtlValue ?? marketBlock.mktttlvalue,
+  );
+  const annualTaxRaw = attomNum(
+    taxBlock.taxAmt ?? taxBlock.taxamt,
+  );
+
+  const sqft = attomNum(
+    size.universalSize ??
+      size.universalsize ??
+      size.livingSize ??
+      size.livingsize ??
+      size.bldgSize ??
+      size.bldgsize ??
+      size.grosssizeadjusted ??
       0,
   );
-  const bathrooms = Number(
-    rooms.bathstotal || rooms.bathscalc || rooms.bathsfull || 0,
+  const yearBuilt = attomNum(
+    prop.summary?.yearbuilt ??
+      prop.summary?.yearBuilt ??
+      prop.building?.summary?.yearbuilteffective ??
+      prop.building?.summary?.yearbuilt ??
+      0,
   );
+  const bedrooms = attomNum(rooms.beds ?? rooms.Beds);
+  const bathrooms = attomNum(
+    rooms.bathsTotal ?? rooms.bathstotal ?? rooms.bathscalc ?? rooms.bathsfull ?? 0,
+  );
+
   return {
     parcelId: prop.identifier?.apn || prop.identifier?.apnOrig || 'N/A',
     assessedValue,
     marketValue,
+    annualTax: annualTaxRaw > 0 ? annualTaxRaw : undefined,
     sqft,
     yearBuilt,
-    bedrooms: Number(rooms.beds || 0),
+    bedrooms,
     bathrooms,
     source: 'ATTOM',
   };
