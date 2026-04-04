@@ -295,38 +295,161 @@ function detectCountyFromString(address) {
   return 'Fulton';
 }
 
+/** ATTOM gateway: send both header casings (basicprofile historically used APIKey; comps use apikey). */
+function attomHeaders() {
+  const key = process.env.ATTOM_API_KEY;
+  return {
+    apikey: key,
+    APIKey: key,
+    accept: 'application/json',
+  };
+}
+
+/**
+ * Merge ATTOM rows: basicprofile has APN/ID; building + summary live on property/detail;
+ * assessed values live on assessment/detail.
+ */
+function mergeAttomPropertyRows(basicRow, detailRow, assessmentRow) {
+  const merged = { ...basicRow };
+  if (detailRow && typeof detailRow === 'object') {
+    if (detailRow.building) {
+      merged.building = { ...(merged.building || {}), ...detailRow.building };
+    }
+    if (detailRow.summary) {
+      merged.summary = { ...(merged.summary || {}), ...detailRow.summary };
+    }
+    if (detailRow.identifier) {
+      merged.identifier = { ...(merged.identifier || {}), ...detailRow.identifier };
+    }
+  }
+  if (assessmentRow?.assessment) {
+    merged.assessment = assessmentRow.assessment;
+  } else if (detailRow?.assessment) {
+    merged.assessment = { ...(merged.assessment || {}), ...detailRow.assessment };
+  }
+  return merged;
+}
+
+function mapAttomRowToAssessment(prop) {
+  const size = prop.building?.size || {};
+  const rooms = prop.building?.rooms || {};
+  const assessedValue =
+    Number(prop.assessment?.assessed?.assdttlvalue) ||
+    Number(
+      prop.assessment?.market?.mktttlvalue
+        ? Math.round(prop.assessment.market.mktttlvalue * 0.4)
+        : 0,
+    ) ||
+    0;
+  const marketValue =
+    Number(prop.assessment?.market?.mktttlvalue) ||
+    Number(assessedValue ? Math.round(assessedValue / 0.4) : 0) ||
+    0;
+  const sqft = Number(
+    size.universalsize || size.livingsize || size.bldgsize || size.grosssizeadjusted || 0,
+  );
+  const yearBuilt = Number(
+    prop.summary?.yearbuilt ||
+      prop.building?.summary?.yearbuilteffective ||
+      prop.building?.summary?.yearbuilt ||
+      0,
+  );
+  const bathrooms = Number(
+    rooms.bathstotal || rooms.bathscalc || rooms.bathsfull || 0,
+  );
+  return {
+    parcelId: prop.identifier?.apn || prop.identifier?.apnOrig || 'N/A',
+    assessedValue,
+    marketValue,
+    sqft,
+    yearBuilt,
+    bedrooms: Number(rooms.beds || 0),
+    bathrooms,
+    source: 'ATTOM',
+  };
+}
+
 async function fetchATTOMAssessment(address, lat, lng) {
   try {
-    const res = await axios.get('https://api.gateway.attomdata.com/propertyapi/v1.0.0/property/basicprofile', {
-      headers: { 'APIKey': process.env.ATTOM_API_KEY, 'Accept': 'application/json' },
-      params: lat && lng
-        ? { latitude: lat, longitude: lng, radius: 0.1 }
-        : { address1: address }
-    });
+    const basicRes = await axios.get(
+      'https://api.gateway.attomdata.com/propertyapi/v1.0.0/property/basicprofile',
+      {
+        headers: attomHeaders(),
+        params:
+          lat && lng
+            ? { latitude: lat, longitude: lng, radius: 0.1 }
+            : { address1: address },
+      },
+    );
 
-    const prop = res.data?.property?.[0];
-    if (!prop) return null;
+    console.log(
+      '[ATTOM] property/basicprofile — raw JSON (before mapping):\n',
+      JSON.stringify(basicRes.data, null, 2),
+    );
 
-    const assessedValue =
-      Number(prop.assessment?.assessed?.assdttlvalue) ||
-      Number(prop.assessment?.market?.mktttlvalue ? Math.round(prop.assessment.market.mktttlvalue * 0.4) : 0) ||
-      0;
+    const basicProp = basicRes.data?.property?.[0];
+    if (!basicProp) return null;
 
-    const marketValue =
-      Number(prop.assessment?.market?.mktttlvalue) ||
-      Number(assessedValue ? Math.round(assessedValue / 0.4) : 0) ||
-      0;
+    const obPropId = basicProp.identifier?.obPropId;
+    if (!obPropId) {
+      console.warn('[ATTOM] basicprofile missing identifier.obPropId; cannot call detail endpoints');
+      return mapAttomRowToAssessment(basicProp);
+    }
 
-    return {
-      parcelId: prop.identifier?.apn || 'N/A',
-      assessedValue,
-      marketValue,
-      sqft: Number(prop.building?.size?.universalsize || 0),
-      yearBuilt: Number(prop.summary?.yearbuilt || prop.building?.summary?.yearbuilt || 0),
-      bedrooms: Number(prop.building?.rooms?.beds || 0),
-      bathrooms: Number(prop.building?.rooms?.bathstotal || 0),
-      source: 'ATTOM'
-    };
+    let detailProp = null;
+    let assessmentProp = null;
+
+    try {
+      const detailRes = await axios.get(
+        'https://api.gateway.attomdata.com/propertyapi/v1.0.0/property/detail',
+        {
+          headers: attomHeaders(),
+          params: { ID: obPropId },
+        },
+      );
+      console.log(
+        '[ATTOM] property/detail — raw JSON (before mapping):\n',
+        JSON.stringify(detailRes.data, null, 2),
+      );
+      detailProp = detailRes.data?.property?.[0] || null;
+    } catch (e) {
+      console.error(
+        '[ATTOM] property/detail failed:',
+        e.response?.status,
+        e.message,
+        e.response?.data ? JSON.stringify(e.response.data) : '',
+      );
+    }
+
+    try {
+      const assessRes = await axios.get(
+        'https://api.gateway.attomdata.com/propertyapi/v1.0.0/assessment/detail',
+        {
+          headers: attomHeaders(),
+          params: { ID: obPropId },
+        },
+      );
+      console.log(
+        '[ATTOM] assessment/detail — raw JSON (before mapping):\n',
+        JSON.stringify(assessRes.data, null, 2),
+      );
+      assessmentProp = assessRes.data?.property?.[0] || null;
+    } catch (e) {
+      console.error(
+        '[ATTOM] assessment/detail failed:',
+        e.response?.status,
+        e.message,
+        e.response?.data ? JSON.stringify(e.response.data) : '',
+      );
+    }
+
+    const merged = mergeAttomPropertyRows(basicProp, detailProp, assessmentProp);
+    console.log(
+      '[ATTOM] merged property row (used for field mapping):\n',
+      JSON.stringify(merged, null, 2),
+    );
+
+    return mapAttomRowToAssessment(merged);
   } catch (err) {
     console.error('ATTOM error:', err.message);
     return null;
