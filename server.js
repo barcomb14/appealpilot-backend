@@ -146,16 +146,25 @@ app.post('/api/comps/search',
   [body('sqft').isInt()],
   async (req, res) => {
     const { lat, lng, sqft, yearBuilt, assessedValue, county } = req.body;
-    const cacheKey = `comps:${(lat||0).toFixed(3)},${(lng||0).toFixed(3)},${sqft}`;
+    const cacheKey = `comps:${(lat || 0).toFixed(4)},${(lng || 0).toFixed(4)},${sqft},${assessedValue},${String(county || '')}`;
     if (cache.has(cacheKey)) return res.json(cache.get(cacheKey));
 
     try {
       let rawComps = [];
-      if (process.env.ATTOM_API_KEY && lat && lng) {
+      // Phase 2: set ATTOM_COMPS_ENABLED=true when sales comparables are on the ATTOM plan.
+      const useAttomComps = process.env.ATTOM_COMPS_ENABLED === 'true';
+      if (useAttomComps && process.env.ATTOM_API_KEY && lat && lng) {
         rawComps = await fetchATTOMComps({ lat, lng, sqft, yearBuilt });
       }
       if (!rawComps.length) {
-        rawComps = generateSampleComps(sqft);
+        rawComps = generateSubjectPlaceholderComps({
+          sqft,
+          assessedValue,
+          county,
+          yearBuilt,
+          lat,
+          lng,
+        });
       }
 
       const subjectPPSF = Math.round((assessedValue / 0.4) / sqft);
@@ -516,15 +525,117 @@ function generateSampleProperty(county) {
   return { assessedValue: 342400, sqft: 2140, yearBuilt: 2003, bedrooms: 4, bathrooms: 2.5, parcelId: 'LOOKUP-REQUIRED', source: 'Sample data — add ATTOM API key for live data' };
 }
 
-function generateSampleComps(sqft) {
-  const streets = ['Ridgewood Ct', 'Briar Glen Dr', 'Millbrook Ln', 'Willow Creek Rd', 'Stonebridge Pkwy'];
-  return [
-    { id: 'S0', address: '847 ' + streets[0], salePrice: Math.round(sqft * 138), sqft: Math.round(sqft * 0.94), yearBuilt: 2001, saleDate: '2025-10-12', distance: 0.3 },
-    { id: 'S1', address: '1102 ' + streets[1], salePrice: Math.round(sqft * 147), sqft: Math.round(sqft * 1.04), yearBuilt: 2004, saleDate: '2025-11-04', distance: 0.5 },
-    { id: 'S2', address: '523 ' + streets[2], salePrice: Math.round(sqft * 133), sqft: Math.round(sqft * 0.97), yearBuilt: 2002, saleDate: '2025-09-18', distance: 0.7 },
-    { id: 'S3', address: '319 ' + streets[3], salePrice: Math.round(sqft * 153), sqft: Math.round(sqft * 1.08), yearBuilt: 2005, saleDate: '2025-12-01', distance: 0.9 },
-    { id: 'S4', address: '754 ' + streets[4], salePrice: Math.round(sqft * 130), sqft: Math.round(sqft * 0.92), yearBuilt: 1999, saleDate: '2025-08-22', distance: 1.1 },
+/** Deterministic PRNG for repeatable placeholder comps per subject. */
+function mulberry32(seed) {
+  return function next() {
+    let t = (seed += 0x6d2b79f5);
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function hashPlaceholderSeed(lat, lng, sqft, assessedValue, county) {
+  const s = `${lat ?? 0}|${lng ?? 0}|${sqft}|${assessedValue}|${String(county || '').toLowerCase()}`;
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0) || 1;
+}
+
+/**
+ * Temporary Phase-1 comps when ATTOM sales comparables are unavailable.
+ * Uses real subject sqft, assessed value, and location for believable $/sqft and sale prices.
+ */
+function generateSubjectPlaceholderComps({ sqft, assessedValue, county, yearBuilt, lat, lng }) {
+  const subjectPPSF = Math.round((assessedValue / 0.4) / sqft);
+  let ppsfHigh = Math.min(175, subjectPPSF - 1);
+  let ppsfLow = 140;
+  if (ppsfHigh < 140) {
+    ppsfLow = Math.max(90, subjectPPSF - 45);
+    ppsfHigh = subjectPPSF - 1;
+  }
+  if (ppsfLow >= ppsfHigh) {
+    ppsfLow = Math.max(80, ppsfHigh - 35);
+  }
+
+  const seed = hashPlaceholderSeed(lat, lng, sqft, assessedValue, county);
+  const isGwinnett = /^gwinnett$/i.test(String(county || '').trim());
+
+  const gwinnettPool = [
+    [1842, 'Brook Hollow Ln', 'Lawrenceville'],
+    [607, 'Old Peachtree Rd NW', 'Duluth'],
+    [3295, 'Sugarloaf Pkwy', 'Lawrenceville'],
+    [884, 'Webb Gin House Rd', 'Snellville'],
+    [1456, 'Cruse Rd NW', 'Lawrenceville'],
+    [2703, 'Buford Dr NE', 'Buford'],
+    [512, 'Rock Springs Rd NE', 'Lawrenceville'],
+    [1788, 'Summerour St', 'Norcross'],
+    [933, 'Parsons Blvd', 'Suwanee'],
+    [2164, 'McKendree Park Dr', 'Duluth'],
   ];
+
+  const genericPool = [
+    [1204, 'Riverside Pkwy', 'Roswell'],
+    [883, 'Chattahoochee River Rd', 'Atlanta'],
+    [2401, 'Johnson Ferry Rd NE', 'Marietta'],
+    [415, 'Piedmont Rd NE', 'Atlanta'],
+    [1655, 'Holcomb Bridge Rd', 'Roswell'],
+    [702, 'Medlock Bridge Rd', 'Johns Creek'],
+    [3388, 'Peachtree Rd NE', 'Atlanta'],
+    [1290, 'Windward Pkwy', 'Alpharetta'],
+    [556, 'East Ponce de Leon Ave', 'Decatur'],
+    [1844, 'Lower Roswell Rd', 'Marietta'],
+  ];
+
+  const pool = isGwinnett ? gwinnettPool : genericPool;
+  const baseYear =
+    typeof yearBuilt === 'number' && yearBuilt > 1800 && yearBuilt < 2100
+      ? yearBuilt
+      : 2000;
+
+  const now = new Date();
+  const comps = [];
+
+  for (let i = 0; i < 5; i++) {
+    const rnd = mulberry32((seed + Math.imul(i, 0x9e3779b9)) >>> 0);
+    const r1 = rnd();
+    const r2 = rnd();
+    const r3 = rnd();
+    const r4 = rnd();
+
+    const ppsf = Math.round(ppsfLow + r1 * (ppsfHigh - ppsfLow));
+    const sqftMult = 0.8 + r2 * 0.4;
+    const compSqft = Math.max(1, Math.round(sqft * sqftMult));
+    const salePrice = Math.round(compSqft * ppsf);
+    const distance = Math.round((0.2 + r3 * 1.0) * 100) / 100;
+    const daysAgo = Math.min(364, Math.floor(18 + r4 * 347));
+    const saleD = new Date(now);
+    saleD.setDate(saleD.getDate() - daysAgo);
+    const saleDate = saleD.toISOString().slice(0, 10);
+
+    const poolIdx = Math.floor(rnd() * pool.length) % pool.length;
+    const [streetNum, streetName, city] = pool[(poolIdx + i) % pool.length];
+    const address = `${streetNum} ${streetName}, ${city}, GA`;
+
+    const ybJitter = Math.floor((rnd() - 0.5) * 10);
+    const yb = Math.min(2024, Math.max(1985, baseYear + ybJitter));
+
+    comps.push({
+      id: `ph-${seed.toString(36)}-${i}`,
+      address,
+      salePrice,
+      saleDate,
+      sqft: compSqft,
+      yearBuilt: yb,
+      distance,
+      source: 'Placeholder (Phase 2: ATTOM comparables)',
+    });
+  }
+
+  return comps;
 }
 
 function buildNarrativePrompt(property, comps, county, recommendedAV, pct) {
