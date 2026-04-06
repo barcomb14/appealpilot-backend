@@ -260,9 +260,10 @@ app.post('/api/email/send-package', async (req, res) => {
     if (!process.env.SENDGRID_API_KEY || process.env.SENDGRID_API_KEY === 'placeholder') {
       return res.json({ success: true, demo: true, message: 'Demo mode — email not sent' });
     }
+    const fromEmail = (process.env.SENDGRID_FROM_EMAIL || '').trim() || 'appeals@localpropertytaxappeals.com';
     const msg = {
       to: email,
-      from: { email: process.env.SENDGRID_FROM_EMAIL || 'appeals@appealpilot.com', name: 'AppealPilot' },
+      from: { email: fromEmail, name: 'AppealPilot' },
       subject: `Your Georgia Property Tax Appeal Package — ${county} County`,
       html: `<div style="font-family:sans-serif;max-width:600px;margin:0 auto">
         <div style="background:#111827;padding:24px;text-align:center">
