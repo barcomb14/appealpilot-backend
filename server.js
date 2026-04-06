@@ -9,6 +9,7 @@ const NodeCache = require('node-cache');
 const rateLimit = require('express-rate-limit');
 const { body, validationResult } = require('express-validator');
 const PDFDocument = require('pdfkit');
+
 const app = express();
 app.set('trust proxy', 1);
 const cache = new NodeCache({ stdTTL: 3600 }); // 1-hour cache
@@ -50,6 +51,14 @@ const GEORGIA_COUNTIES = {
   'Hall':      { millage:  9.50, rate: 0.00950, deadline: 'June 7, 2026',   assessor: 'Hall County Board of Assessors, 2875 Browns Bridge Rd, Gainesville GA 30504' },
   'Chatham':   { millage: 10.80, rate: 0.01080, deadline: 'June 14, 2026',  assessor: 'Chatham County Board of Assessors, 222 W Oglethorpe Ave, Savannah GA 31401' },
 };
+
+function countyConfigForName(name) {
+  const n = String(name || '').trim();
+  if (!n) return null;
+  if (GEORGIA_COUNTIES[n]) return GEORGIA_COUNTIES[n];
+  const key = Object.keys(GEORGIA_COUNTIES).find((k) => k.toLowerCase() === n.toLowerCase());
+  return key ? GEORGIA_COUNTIES[key] : null;
+}
 
 // ── ROUTE 1: Address Lookup ───────────────────────────────────────
 app.post('/api/address/lookup',
@@ -288,7 +297,105 @@ app.post('/api/email/send-package', async (req, res) => {
   }
 });
 
-// ── ROUTE 7: Health Check ─────────────────────────────────────────
+// ── ROUTE 7: DIY appeal package PDF (PT-311A + exhibits) ─────────
+app.post(
+  '/api/package/generate',
+  [
+    body('ownerName').trim().notEmpty(),
+    body('address').trim().notEmpty(),
+    body('county').trim().notEmpty(),
+    body('narrative').trim().notEmpty(),
+    body('comps').optional().isArray(),
+    body('assessedValue').optional(),
+    body('proposedValue').optional(),
+    body('parcelId').optional(),
+    body('deadline').optional(),
+    body('assessorAddr').optional(),
+    body('leadId').optional(),
+    body('subjectPPSF').optional().isNumeric(),
+    body('sqft').optional().isNumeric(),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+    const {
+      leadId,
+      ownerName,
+      address,
+      county,
+      parcelId,
+      assessedValue,
+      proposedValue,
+      deadline,
+      assessorAddr,
+      comps,
+      narrative,
+      subjectPPSF,
+      sqft,
+    } = req.body;
+
+    const compsList = Array.isArray(comps) ? comps : [];
+    const cc = countyConfigForName(county);
+    const safeDeadline = deadline || cc?.deadline || 'See county assessor';
+    const safeAssessor =
+      assessorAddr ||
+      cc?.assessor ||
+      'County Board of Assessors (verify current mailing address)';
+    const parcel = parcelId != null && String(parcelId).trim() !== '' ? String(parcelId) : '________________';
+    const av =
+      assessedValue != null && assessedValue !== ''
+        ? Number(assessedValue)
+        : null;
+    const pv =
+      proposedValue != null && proposedValue !== ''
+        ? Number(proposedValue)
+        : null;
+    const fmtMoney = (n) =>
+      n != null && Number.isFinite(n)
+        ? '$' + Math.round(n).toLocaleString('en-US')
+        : '________________';
+    let displaySubjectPpsf = null;
+    if (subjectPPSF != null && subjectPPSF !== '') {
+      const n = Number(subjectPPSF);
+      if (Number.isFinite(n)) displaySubjectPpsf = n;
+    } else if (sqft != null && av != null && Number(sqft) > 0) {
+      const impliedFmv = av / 0.4;
+      displaySubjectPpsf = Math.round(impliedFmv / Number(sqft));
+    }
+
+    try {
+      const pdfBuffer = await buildAppealPackagePdf({
+        leadId,
+        ownerName,
+        address,
+        county,
+        parcel,
+        assessedDisplay: fmtMoney(av),
+        proposedDisplay: fmtMoney(pv),
+        basisForAppeal:
+          'Comparable arm\'s-length sales in the subject neighborhood support a fair market value below that implied by the current assessment; see Exhibit A.',
+        deadline: safeDeadline,
+        assessorAddr: safeAssessor,
+        comps: compsList,
+        narrative: String(narrative).trim(),
+        subjectPpsfDisplay:
+          displaySubjectPpsf != null ? '$' + displaySubjectPpsf.toLocaleString('en-US') + ' / sq ft' : 'Provide on worksheet if known',
+      });
+
+      const fname = `AppealPilot-Package-${String(leadId || 'draft').replace(/[^a-zA-Z0-9-_]/g, '_')}.pdf`;
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="${fname}"`);
+      res.setHeader('Content-Length', pdfBuffer.length);
+      res.send(pdfBuffer);
+    } catch (err) {
+      console.error('Package PDF error:', err.message);
+      res.status(500).json({ error: 'PDF generation failed: ' + err.message });
+    }
+  },
+);
+
+// ── ROUTE 8: Health Check ─────────────────────────────────────────
 app.get('/api/health', (req, res) => res.json({
   status: 'ok',
   service: 'AppealPilot API',
@@ -302,6 +409,192 @@ app.get('/api/health', (req, res) => res.json({
 }));
 
 // ── HELPERS ───────────────────────────────────────────────────────
+/**
+ * Four-page DIY appeal PDF: PT-311A-style form, Exhibit A (comps), Exhibit B (narrative), filing instructions.
+ * Phase 2: optional upload to cloud storage; response is binary PDF only.
+ */
+function buildAppealPackagePdf(data) {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ size: 'LETTER', margin: 48, bufferPages: false });
+    const chunks = [];
+    doc.on('data', (c) => chunks.push(c));
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+
+    const pageW = doc.page.width;
+    const margin = 48;
+    const contentW = pageW - margin * 2;
+    const { ownerName, address, county, parcel, assessedDisplay, proposedDisplay, basisForAppeal, deadline, assessorAddr, comps, narrative, subjectPpsfDisplay } = data;
+
+    // ── Page 1: PT-311A-style form ─────────────────────────────
+    doc.font('Helvetica-Bold').fontSize(11).text('State of Georgia', { align: 'center' });
+    doc.font('Helvetica').fontSize(10).text('Department of Revenue', { align: 'center' });
+    doc.moveDown(0.6);
+    doc.font('Helvetica-Bold').fontSize(13).text('PT-311A', { align: 'center' });
+    doc.fontSize(11).text('Taxpayer\'s Appeal of Assessment of Real Property', { align: 'center' });
+    doc.moveDown(0.8);
+    doc.font('Helvetica-Bold').fontSize(10).text('Tax Year: 2026');
+    doc.moveDown(0.5);
+
+    doc.font('Helvetica-Bold').fontSize(10).text('Section A — Property Owner');
+    doc.font('Helvetica').fontSize(9);
+    doc.text('Owner name: ' + ownerName);
+    doc.text('Property address: ' + address);
+    doc.text('County: ' + county);
+    doc.text('Parcel ID / Map & parcel: ' + parcel);
+    doc.moveDown(0.6);
+
+    doc.font('Helvetica-Bold').fontSize(10).text('Section B — Assessment Values');
+    doc.font('Helvetica').fontSize(9);
+    doc.text('Current assessed value (as shown on notice): ' + assessedDisplay);
+    doc.text('Taxpayer\'s proposed fair market value (if applicable): ' + proposedDisplay);
+    doc.text('Basis for appeal: ' + basisForAppeal, { width: contentW });
+    doc.moveDown(0.6);
+
+    doc.font('Helvetica-Bold').fontSize(10).text('Section C — Method of Appeal');
+    doc.font('Helvetica').fontSize(9);
+    doc.text('☑  Board of Equalization (BOE)');
+    doc.text('☐  Hearing with Board of Assessors');
+    doc.text('☐  Other (specify): ________________________________');
+    doc.moveDown(1.2);
+
+    doc.text('Signature of property owner or authorized agent: _________________________________');
+    doc.text('Date: _______________');
+    doc.moveDown(0.8);
+
+    const deadlineBoxTop = doc.y;
+    doc.roundedRect(margin, deadlineBoxTop, contentW, 56, 4).stroke('#b45309');
+    doc.font('Helvetica-Bold').fontSize(11).fillColor('#b45309');
+    doc.text('FILING DEADLINE — Your appeal must be filed (postmarked) by:', margin + 8, deadlineBoxTop + 6, {
+      width: contentW - 16,
+    });
+    doc.fontSize(12).text(deadline, margin + 8, deadlineBoxTop + 22, { width: contentW - 16 });
+    doc.fillColor('black');
+    doc.font('Helvetica').fontSize(8).text(
+      'Verify this date with your county; deadlines vary. This form is a worksheet — use official county/DOR instructions where required.',
+      margin + 8,
+      deadlineBoxTop + 40,
+      { width: contentW - 16 },
+    );
+    doc.y = deadlineBoxTop + 62;
+
+    doc.addPage();
+
+    // ── Page 2: Exhibit A — comparables ─────────────────────────
+    doc.font('Helvetica-Bold').fontSize(14).text('Exhibit A: Comparable Sales Evidence', { underline: true });
+    doc.moveDown(0.4);
+    doc.font('Helvetica').fontSize(9).text('Selected comparable sales supporting the taxpayer\'s proposed value.', { width: contentW });
+    doc.moveDown(0.5);
+    doc.font('Helvetica-Bold').fontSize(9).text('Subject property (implied comparison): ' + subjectPpsfDisplay);
+    doc.moveDown(0.4);
+
+    const colX = [margin, margin + 108, margin + 218, margin + 288, margin + 338, margin + 388];
+    const rowH = 14;
+    let y = doc.y;
+
+    function row(cells, bold) {
+      doc.font(bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(7);
+      let x = colX[0];
+      for (let i = 0; i < cells.length; i++) {
+        const w = (colX[i + 1] || pageW - margin) - colX[i] - 2;
+        doc.text(String(cells[i] ?? ''), x, y, { width: w, ellipsis: true });
+        x = colX[i + 1] || x;
+      }
+      y += rowH;
+      if (y > doc.page.height - 80) {
+        doc.addPage();
+        y = margin;
+      }
+    }
+
+    row(['Address', 'Sale date', 'Price', 'Sqft', '$/sqft', 'Mi.'], true);
+    doc.moveTo(margin, y - 2).lineTo(pageW - margin, y - 2).stroke();
+    y += 4;
+
+    for (const c of comps) {
+      const ppsf =
+        c.pricePerSqft != null
+          ? c.pricePerSqft
+          : c.sqft > 0 && c.salePrice
+            ? Math.round(Number(c.salePrice) / Number(c.sqft))
+            : '—';
+      row(
+        [
+          c.address || '—',
+          c.saleDate || '—',
+          c.salePrice != null ? '$' + Number(c.salePrice).toLocaleString('en-US') : '—',
+          c.sqft != null ? String(c.sqft) : '—',
+          ppsf !== '—' && typeof ppsf === 'number' ? '$' + ppsf : String(ppsf),
+          c.distance != null ? String(c.distance) : '—',
+        ],
+        false,
+      );
+    }
+    if (!comps.length) {
+      row(['— No comparables in request —', '', '', '', '', ''], false);
+    }
+
+    doc.y = Math.max(doc.y, y + 6);
+    doc.font('Helvetica').fontSize(8).fillColor('#444444');
+    doc.text(
+      'Source: Comparable sales from county public records, MLS, or third-party property data (ATTOM or placeholder per AppealPilot workflow). Verify all sales before filing.',
+      { width: contentW },
+    );
+    doc.fillColor('black');
+
+    doc.addPage();
+
+    // ── Page 3: Exhibit B — narrative ───────────────────────────
+    doc.font('Helvetica-Bold').fontSize(14).text('Exhibit B: Evidence Narrative', { underline: true });
+    doc.moveDown(0.6);
+    doc.font('Helvetica').fontSize(10).text(narrative, { width: contentW, align: 'justify' });
+    doc.moveDown(1);
+    doc.font('Helvetica-Bold').fontSize(10).text('Legal citation');
+    doc.font('Helvetica').fontSize(10).text('O.C.G.A. § 48-5-2 (uniformity and fair market value).');
+
+    doc.addPage();
+
+    // ── Page 4: Filing instructions ─────────────────────────────
+    doc.font('Helvetica-Bold').fontSize(14).text('Filing Instructions — ' + county + ' County', { underline: true });
+    doc.moveDown(0.5);
+    doc.font('Helvetica').fontSize(10);
+    const steps = [
+      'Complete and sign the PT-311A worksheet (page 1). Use the official Georgia DOR / county form if your county requires it.',
+      'Attach Exhibit A (comparable sales) and Exhibit B (narrative) to your filing.',
+      'Make a complete copy of the signed form and all exhibits for your records.',
+      'Mail your appeal to the assessor at the address below using the U.S. Postal Service. Consider certificate of mailing or certified mail for proof of timely filing.',
+      'Confirm filing procedures and any county-specific forms on your county Board of Assessors website.',
+    ];
+    steps.forEach((s, i) => {
+      doc.text(`${i + 1}. ${s}`, { width: contentW, align: 'left' });
+      doc.moveDown(0.35);
+    });
+    doc.moveDown(0.3);
+    doc.font('Helvetica-Bold').fontSize(10).text('Assessor mailing address');
+    doc.font('Helvetica').fontSize(10).text(assessorAddr, { width: contentW });
+    doc.moveDown(0.8);
+
+    doc.font('Helvetica-Bold').fontSize(20).fillColor('red');
+    doc.text('DEADLINE: ' + deadline, { width: contentW, align: 'center' });
+    doc.fillColor('black');
+    doc.moveDown(0.8);
+
+    const mailBoxTop = doc.y;
+    doc.roundedRect(margin, mailBoxTop, contentW, 58, 4).fillAndStroke('#fff7ed', '#ea580c');
+    doc.fillColor('black');
+    doc.font('Helvetica-Bold').fontSize(10).text('Certificate of mailing', margin + 10, mailBoxTop + 8, { width: contentW - 20 });
+    doc.font('Helvetica').fontSize(9).text(
+      'Georgia appeal deadlines are typically enforced by postmark date. Keep your postal receipt or certificate of mailing (PS Form 3817 or equivalent) with your records as proof of timely filing.',
+      margin + 10,
+      mailBoxTop + 24,
+      { width: contentW - 20 },
+    );
+    doc.y = mailBoxTop + 64;
+
+    doc.end();
+  });
+}
+
 function detectCountyFromString(address) {
   const a = address.toLowerCase();
   if (a.includes('marietta') || a.includes('kennesaw') || a.includes('smyrna')) return 'Cobb';
@@ -648,180 +941,7 @@ function getFallbackNarrative(property, comps, county, recommendedAV, pct) {
   const yourPPSF = Math.round((property.assessedValue / 0.4) / property.sqft);
   return `The taxpayer respectfully submits that the ${county} County Board of Assessors' 2026 assessment overstates the subject property's fair market value under O.C.G.A. § 48-5-2. Analysis of ${comps.length} arm's-length comparable sales within one mile reveals an average price of $${avgPPSF} per square foot, compared to the $${yourPPSF} per square foot implied by the current assessment — a difference of approximately ${pct}%. The taxpayer requests a reduction in assessed value to $${recommendedAV.toLocaleString()}, consistent with the enclosed comparable sales evidence. All cited transactions are verified arm's-length sales from ${county} County public records.`;
 }
-// ── ROUTE: Generate PDF Package ───────────────────────────────────
-app.post('/api/package/generate', async (req, res) => {
-  const {
-    ownerName, address, county, parcelId,
-    assessedValue, proposedValue, deadline,
-    assessorAddr, comps, narrative
-  } = req.body;
 
-  try {
-    const doc = new PDFDocument({ margin: 50, size: 'LETTER' });
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="appealpilot-package-${county}.pdf"`);
-    doc.pipe(res);
-
-    const GREEN = '#16a34a';
-    const RED = '#dc2626';
-    const DARK = '#111827';
-    const GRAY = '#6b7280';
-    const fmt = n => n ? '$' + Math.round(n).toLocaleString() : '—';
-
-    // ── PAGE 1: PT-311A ──────────────────────────────────────────
-    doc.fontSize(10).fillColor(GRAY).text('STATE OF GEORGIA — DEPARTMENT OF REVENUE', { align: 'center' });
-    doc.moveDown(0.3);
-    doc.fontSize(14).fillColor(DARK).font('Helvetica-Bold').text('PT-311A', { align: 'center' });
-    doc.fontSize(11).font('Helvetica').text("TAXPAYER'S APPEAL OF ASSESSMENT OF REAL PROPERTY", { align: 'center' });
-    doc.fontSize(10).fillColor(GRAY).text('TAX YEAR 2026', { align: 'center' });
-    doc.moveDown(0.5);
-
-    // Red deadline banner
-    doc.rect(50, doc.y, 512, 36).fill('#fef2f2');
-    doc.fillColor(RED).fontSize(10).font('Helvetica-Bold')
-      .text(`⚠  APPEAL DEADLINE: ${deadline || 'See county notice'}`, 60, doc.y - 28, { align: 'center' });
-    doc.moveDown(1.5);
-
-    // Section A
-    doc.fillColor(GREEN).fontSize(10).font('Helvetica-Bold').text('SECTION A — PROPERTY OWNER');
-    doc.moveTo(50, doc.y).lineTo(562, doc.y).stroke(GREEN);
-    doc.moveDown(0.3);
-
-    const field = (label, value) => {
-      doc.fillColor(GRAY).fontSize(9).font('Helvetica').text(label, { continued: true });
-      doc.fillColor(DARK).font('Helvetica-Bold').text('  ' + (value || '—'));
-      doc.moveDown(0.2);
-    };
-
-    field('Owner Name:', ownerName);
-    field('Property Address:', address);
-    field('County:', county + ' County, Georgia');
-    field('Parcel ID:', parcelId);
-    doc.moveDown(0.5);
-
-    // Section B
-    doc.fillColor(GREEN).fontSize(10).font('Helvetica-Bold').text('SECTION B — ASSESSMENT VALUES');
-    doc.moveTo(50, doc.y).lineTo(562, doc.y).stroke(GREEN);
-    doc.moveDown(0.3);
-
-    field('Current Assessed Value:', fmt(assessedValue));
-    field("Taxpayer's Proposed Value:", fmt(proposedValue));
-    field('Basis for Appeal:', 'Value — comparable sales support a lower FMV per O.C.G.A. § 48-5-2');
-    doc.moveDown(0.5);
-
-    // Section C
-    doc.fillColor(GREEN).fontSize(10).font('Helvetica-Bold').text('SECTION C — METHOD OF APPEAL');
-    doc.moveTo(50, doc.y).lineTo(562, doc.y).stroke(GREEN);
-    doc.moveDown(0.3);
-    doc.fillColor(DARK).fontSize(10).font('Helvetica').text('[X] Board of Equalization     [ ] Hearing Officer     [ ] Arbitration');
-    doc.moveDown(1.5);
-
-    // Signature
-    doc.moveTo(50, doc.y).lineTo(300, doc.y).stroke(DARK);
-    doc.fillColor(GRAY).fontSize(8).text('Taxpayer Signature', 50, doc.y + 2);
-    doc.moveTo(350, doc.y - 12).lineTo(562, doc.y - 12).stroke(DARK);
-    doc.text('Date', 350, doc.y + 2);
-    doc.moveDown(2);
-
-    doc.fillColor(GRAY).fontSize(8).font('Helvetica')
-      .text('Prepared by AppealPilot — Not a law firm — Not legal advice — localpropertytaxappeals.com', { align: 'center' });
-
-    // ── PAGE 2: COMPARABLE SALES ─────────────────────────────────
-    doc.addPage();
-    doc.fillColor(GREEN).fontSize(14).font('Helvetica-Bold').text('EXHIBIT A — COMPARABLE SALES EVIDENCE');
-    doc.moveTo(50, doc.y).lineTo(562, doc.y).stroke(GREEN);
-    doc.moveDown(0.5);
-
-    doc.fillColor(GRAY).fontSize(9).font('Helvetica')
-      .text(`The following arm's-length sales were identified within 1.5 miles of the subject property and are submitted as evidence of fair market value under O.C.G.A. § 48-5-2.`);
-    doc.moveDown(0.8);
-
-    // Table header
-    const cols = [50, 210, 290, 360, 420, 480];
-    doc.rect(50, doc.y, 512, 20).fill('#f0fdf4');
-    doc.fillColor(GREEN).fontSize(8).font('Helvetica-Bold');
-    doc.text('ADDRESS', cols[0], doc.y - 15);
-    doc.text('SALE DATE', cols[1], doc.y - 15);
-    doc.text('PRICE', cols[2], doc.y - 15);
-    doc.text('SQFT', cols[3], doc.y - 15);
-    doc.text('$/SQFT', cols[4], doc.y - 15);
-    doc.text('DIST', cols[5], doc.y - 15);
-    doc.moveDown(0.5);
-
-    const compList = Array.isArray(comps) ? comps : [];
-    compList.forEach((c, i) => {
-      const rowY = doc.y;
-      if (i % 2 === 0) doc.rect(50, rowY, 512, 18).fill('#f9fafb');
-      doc.fillColor(DARK).fontSize(8).font('Helvetica');
-      doc.text(c.address || '—', cols[0], rowY + 4, { width: 155 });
-      doc.text(c.saleDate || c.date || '—', cols[1], rowY + 4);
-      doc.text(fmt(c.salePrice || c.price), cols[2], rowY + 4);
-      doc.text((c.sqft || 0).toLocaleString(), cols[3], rowY + 4);
-      doc.text('$' + (c.pricePerSqft || c.ppsf || 0), cols[4], rowY + 4);
-      doc.text((c.distance || c.dist || '—') + ' mi', cols[5], rowY + 4);
-      doc.moveDown(1.1);
-    });
-
-    doc.moveDown(0.5);
-    doc.fillColor(GRAY).fontSize(8).text('Source: ATTOM Property Data / AppealPilot comparable sales analysis');
-
-    // ── PAGE 3: NARRATIVE ────────────────────────────────────────
-    doc.addPage();
-    doc.fillColor(GREEN).fontSize(14).font('Helvetica-Bold').text('EXHIBIT B — EVIDENCE NARRATIVE');
-    doc.moveTo(50, doc.y).lineTo(562, doc.y).stroke(GREEN);
-    doc.moveDown(0.8);
-
-    doc.fillColor(DARK).fontSize(10).font('Helvetica')
-      .text(narrative || 'Evidence narrative not available.', { lineGap: 4 });
-    doc.moveDown(1);
-    doc.fillColor(GRAY).fontSize(8).text('Legal reference: O.C.G.A. § 48-5-2 (fair market value standard) and O.C.G.A. § 48-5-299(c) (3-year value freeze upon successful appeal with written evidence).');
-
-    // ── PAGE 4: FILING INSTRUCTIONS ─────────────────────────────
-    doc.addPage();
-    doc.fillColor(GREEN).fontSize(14).font('Helvetica-Bold').text('FILING INSTRUCTIONS');
-    doc.moveTo(50, doc.y).lineTo(562, doc.y).stroke(GREEN);
-    doc.moveDown(0.5);
-
-    // Deadline box
-    doc.rect(50, doc.y, 512, 50).fill('#fef2f2');
-    doc.fillColor(RED).fontSize(16).font('Helvetica-Bold')
-      .text(`DEADLINE: ${deadline || 'See your assessment notice'}`, 60, doc.y - 42, { align: 'center' });
-    doc.fillColor(RED).fontSize(9).font('Helvetica')
-      .text('Your PT-311A must be POSTMARKED by this date. Late filings are rejected.', { align: 'center' });
-    doc.moveDown(1.5);
-
-    const steps = [
-      'Print this entire packet (all 4 pages).',
-      'Sign and date the PT-311A form on Page 1.',
-      'Make a copy of everything for your records.',
-      'Mail via USPS First Class Mail with Certificate of Mailing.',
-      `Address the envelope to:\n${assessorAddr || county + ' County Board of Tax Assessors'}`,
-      'Keep the USPS postmark receipt — this is your proof of timely filing.',
-      'Expect a response from the county within 4–8 weeks.',
-    ];
-
-    steps.forEach((step, i) => {
-      doc.fillColor(GREEN).fontSize(11).font('Helvetica-Bold').text(`${i + 1}.`, 50, doc.y, { continued: true });
-      doc.fillColor(DARK).fontSize(10).font('Helvetica').text('  ' + step, { lineGap: 2 });
-      doc.moveDown(0.6);
-    });
-
-    doc.moveDown(1);
-    doc.rect(50, doc.y, 512, 60).fill('#f0fdf4');
-    doc.fillColor(GREEN).fontSize(10).font('Helvetica-Bold')
-      .text('WHAT HAPPENS AFTER YOU FILE:', 60, doc.y - 50);
-    doc.fillColor(DARK).fontSize(9).font('Helvetica')
-      .text('The county will either (1) send an Amended Notice of Assessment reducing your value, or (2) schedule a Board of Equalization hearing. If you receive a hearing notice, bring this packet and your USPS receipt.', 60, doc.y, { width: 490 });
-
-    doc.end();
-
-  } catch (err) {
-    console.error('[pdf] generation error:', err.message);
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'PDF generation failed: ' + err.message });
-    }
-  }
-});
 // ── START ─────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.json({ ok: true, service: 'AppealPilot API' });
