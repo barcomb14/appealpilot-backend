@@ -152,18 +152,30 @@ app.post('/api/property/assessment',
 
 // ── ROUTE 3: Comparable Sales ─────────────────────────────────────
 app.post('/api/comps/search',
-  [body('sqft').isInt()],
+  [body('sqft').isInt(), body('address').optional({ checkFalsy: true }).isString().trim()],
   async (req, res) => {
-    const { lat, lng, sqft, yearBuilt, assessedValue, county } = req.body;
-    const cacheKey = `comps:${(lat || 0).toFixed(4)},${(lng || 0).toFixed(4)},${sqft},${assessedValue},${String(county || '')}`;
+    const { lat, lng, sqft, yearBuilt, assessedValue, county, address } = req.body;
+    const addrKey = String(address || '')
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, '_')
+      .slice(0, 120);
+    const cacheKey = `comps:${(lat || 0).toFixed(4)},${(lng || 0).toFixed(4)},${sqft},${assessedValue},${String(county || '')},${addrKey}`;
     if (cache.has(cacheKey)) return res.json(cache.get(cacheKey));
 
     try {
       let rawComps = [];
-      // Phase 2: set ATTOM_COMPS_ENABLED=true when sales comparables are on the ATTOM plan.
+      // Set ATTOM_COMPS_ENABLED=true on Railway when using live ATTOM comparables.
       const useAttomComps = process.env.ATTOM_COMPS_ENABLED === 'true';
-      if (useAttomComps && process.env.ATTOM_API_KEY && lat && lng) {
-        rawComps = await fetchATTOMComps({ lat, lng, sqft, yearBuilt });
+      if (useAttomComps && process.env.ATTOM_API_KEY) {
+        rawComps = await fetchATTOMComps({
+          address: typeof address === 'string' ? address.trim() : '',
+          county: typeof county === 'string' ? county.trim() : '',
+          lat,
+          lng,
+          sqft,
+          yearBuilt,
+        });
       }
       if (!rawComps.length) {
         rawComps = generateSubjectPlaceholderComps({
@@ -400,9 +412,10 @@ app.post(
 app.get('/api/health', (req, res) => res.json({
   status: 'ok',
   service: 'AppealPilot API',
-  integrations: {
+    integrations: {
     googleMaps:  !!process.env.GOOGLE_MAPS_API_KEY,
     attom:       !!process.env.ATTOM_API_KEY,
+    attomComps:  process.env.ATTOM_COMPS_ENABLED === 'true' && !!process.env.ATTOM_API_KEY,
     anthropic:   !!(process.env.ANTHROPIC_API_KEY && process.env.ANTHROPIC_API_KEY !== 'placeholder'),
     stripe:      !!(process.env.STRIPE_SECRET_KEY && process.env.STRIPE_SECRET_KEY !== 'placeholder'),
     sendgrid:    !!(process.env.SENDGRID_API_KEY && process.env.SENDGRID_API_KEY !== 'placeholder'),
@@ -792,26 +805,195 @@ async function fetchATTOMAssessment(address, lat, lng) {
     return null;
   }
 }
-async function fetchATTOMComps({ lat, lng, sqft }) {
+const ATTOM_COMPS_API_BASE =
+  (process.env.ATTOM_COMPS_API_BASE || 'https://api.attomdata.com/propertyapi/v1.0.0').replace(/\/+$/, '');
+
+function attomStatusOk(data) {
+  const code = data?.status?.code;
+  if (code === undefined || code === null) return true;
+  return Number(code) === 0;
+}
+
+/** Collect comparable rows from varied ATTOM response envelopes. */
+function attomComparableRowsFromPayload(data) {
+  if (!data || typeof data !== 'object') return [];
+  const d = data;
+  if (Array.isArray(d.property)) return d.property;
+  if (Array.isArray(d.salescomparables)) return d.salescomparables;
+  if (Array.isArray(d.comparables)) return d.comparables;
+  if (Array.isArray(d.comp)) return d.comp;
+  return [];
+}
+
+function formatAttomAddress(prop) {
+  const a = prop?.address || {};
+  const line1 = a.line1 || a.line2 || a.oneLine || '';
+  const locality = a.locality || a.city || '';
+  const region = a.countrySubd || '';
+  const zip = a.postal1 || '';
+  const parts = [line1, locality, region, zip].filter(Boolean);
+  if (parts.length) return parts.join(', ');
+  if (typeof a.oneLine === 'string' && a.oneLine.trim()) return a.oneLine.trim();
+  return 'Address unavailable';
+}
+
+function attomSalePrice(prop) {
+  const sale = prop?.sale || {};
+  const amt = sale.amount || sale.Amount || {};
+  return attomNum(
+    amt.saleAmt ??
+      amt.saleamt ??
+      amt.SaleAmt ??
+      sale.saleAmt ??
+      sale.saleamt,
+  );
+}
+
+function attomSaleDateStr(prop) {
+  const sale = prop?.sale || {};
+  const amt = sale.amount || {};
+  const raw =
+    amt.salerecdate ??
+      amt.saleRecDate ??
+      sale.saleRecDate ??
+      sale.salerecdate ??
+      sale.saleTransDate ??
+      sale.salesearchdate ??
+      '';
+  return raw ? String(raw) : '';
+}
+
+function attomCompSqft(prop) {
+  const size = prop?.building?.size || prop?.building?.Size || {};
+  return attomNum(
+    size.universalSize ??
+      size.universalsize ??
+      size.livingSize ??
+      size.livingsize ??
+      size.bldgSize ??
+      size.bldgsize,
+  );
+}
+
+function attomCompDistanceMiles(prop) {
+  const n = attomNum(
+    prop?.distance ??
+      prop?.distanceInMiles ??
+      prop?.distanceinmiles ??
+      prop?.location?.distance ??
+      prop?.comparable?.distance,
+  );
+  return n > 0 ? n : 0;
+}
+
+function attomCompId(prop, idx) {
+  const id =
+    prop?.identifier?.obPropId ??
+    prop?.identifier?.attomId ??
+    prop?.identifier?.Id ??
+    prop?.identifier?.id;
+  if (id != null && String(id).trim() !== '') return `attom-${String(id)}`;
+  return `attom-${idx}`;
+}
+
+/**
+ * Map one ATTOM property/comparable row to the AppealPilot comp shape.
+ */
+function mapAttomRowToComp(prop, idx) {
+  const salePrice = attomSalePrice(prop);
+  const sqft = attomCompSqft(prop);
+  if (!(salePrice > 0) || !(sqft > 0)) return null;
+  const pricePerSqft = Math.round(salePrice / sqft);
+  return {
+    id: attomCompId(prop, idx),
+    address: formatAttomAddress(prop),
+    saleDate: attomSaleDateStr(prop),
+    salePrice,
+    sqft,
+    pricePerSqft,
+    distance: attomCompDistanceMiles(prop),
+    source: 'ATTOM',
+  };
+}
+
+function mapAttomPayloadToComps(data) {
+  const rows = attomComparableRowsFromPayload(data);
+  const out = [];
+  for (let i = 0; i < rows.length; i++) {
+    const c = mapAttomRowToComp(rows[i], i);
+    if (c) out.push(c);
+  }
+  return out;
+}
+
+async function fetchAttomSalesComparablesByAddress(address, county) {
+  if (!process.env.ATTOM_API_KEY || !String(address).trim() || !String(county).trim()) return [];
+  const url = `${ATTOM_COMPS_API_BASE}/salescomparables`;
   try {
-    const res = await axios.get('https://api.gateway.attomdata.com/propertyapi/v1.0.0/salescomparables/address', {
-      headers: { 'apikey': process.env.ATTOM_API_KEY, 'accept': 'application/json' },
-      params: { latitude: lat, longitude: lng, searchRadius: 1.0, minSqFt: Math.round(sqft * 0.7), maxSqFt: Math.round(sqft * 1.3), pageSize: 10 }
+    const response = await axios.get(url, {
+      headers: attomHeaders(),
+      params: {
+        address: String(address).trim(),
+        county: String(county).trim(),
+        radius: 1,
+        maxResults: 10,
+      },
     });
-    return (res.data?.salescomparables || []).map((c, i) => ({
-      id: 'attom-' + i,
-      address: `${c.address?.line1}, ${c.address?.locality}`,
-      salePrice: c.sale?.amount?.saleAmt,
-      saleDate: c.sale?.saleRecDate,
-      sqft: c.building?.size?.universalsize,
-      yearBuilt: c.building?.summary?.yearbuilt,
-      distance: c.distanceInMiles,
-      source: 'ATTOM'
-    })).filter(c => c.salePrice > 0 && c.sqft > 0);
+    console.log('[ATTOM comps] endpoint response:', JSON.stringify(response.data, null, 2));
+    if (!attomStatusOk(response.data)) {
+      console.warn('[ATTOM comps] salescomparables non-success status:', response.data?.status);
+      return [];
+    }
+    return mapAttomPayloadToComps(response.data);
   } catch (err) {
-    console.error('ATTOM comps error:', err.message);
+    console.error('[ATTOM comps] salescomparables request failed:', err.message, err.response?.status);
+    if (err.response?.data) {
+      console.log('[ATTOM comps] endpoint response:', JSON.stringify(err.response.data, null, 2));
+    }
     return [];
   }
+}
+
+async function fetchAttomSaleSnapshot(lat, lng) {
+  if (!process.env.ATTOM_API_KEY || lat == null || lng == null) return [];
+  const url = `${ATTOM_COMPS_API_BASE}/sale/snapshot`;
+  try {
+    const response = await axios.get(url, {
+      headers: attomHeaders(),
+      params: {
+        latitude: lat,
+        longitude: lng,
+        radius: 1,
+        orderby: 'SaleAmt DESC',
+      },
+    });
+    console.log('[ATTOM comps] endpoint response:', JSON.stringify(response.data, null, 2));
+    if (!attomStatusOk(response.data)) {
+      console.warn('[ATTOM comps] sale/snapshot non-success status:', response.data?.status);
+      return [];
+    }
+    return mapAttomPayloadToComps(response.data);
+  } catch (err) {
+    console.error('[ATTOM comps] sale/snapshot request failed:', err.message, err.response?.status);
+    if (err.response?.data) {
+      console.log('[ATTOM comps] endpoint response:', JSON.stringify(err.response.data, null, 2));
+    }
+    return [];
+  }
+}
+
+/**
+ * Live ATTOM comparables: /salescomparables (address + county), then /sale/snapshot (lat/lng).
+ */
+async function fetchATTOMComps({ address, county, lat, lng }) {
+  let comps = [];
+  if (address && county) {
+    comps = await fetchAttomSalesComparablesByAddress(address, county);
+  }
+  if (!comps.length && lat != null && lng != null) {
+    comps = await fetchAttomSaleSnapshot(Number(lat), Number(lng));
+  }
+  return comps;
 }
 
 function generateSampleProperty(county) {
